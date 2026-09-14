@@ -29,12 +29,28 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# Google Sheets limits (as of 2026): a spreadsheet maxes out at 10,000,000
+# cells total across all its sheets, and importing/uploading a source file
+# larger than ~100MB is rejected outright. GOOGLE_SHEETS_SAFE_CELLS is kept
+# well under the hard cap because the target is an *existing* sheet that
+# likely already holds data, and several part files will be imported into
+# it one after another, each adding to the running total.
+GOOGLE_SHEETS_SAFE_CELLS = 2_000_000
+GOOGLE_SHEETS_MAX_FILE_BYTES = 90 * 1024 * 1024
+
+
+def count_csv_columns(path):
+    """Return the column count of a CSV's first row (min 1)."""
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        first_row = next(csv.reader(f), [])
+    return max(len(first_row), 1)
+
 
 class CSVSplitterApp:
     def __init__(self, root):
         self.root = root
         root.title("CSV Splitter")
-        root.geometry("520x320")
+        root.geometry("520x360")
         root.resizable(False, False)
 
         # Set the window/taskbar icon (Windows uses .ico; falls back quietly
@@ -51,6 +67,7 @@ class CSVSplitterApp:
         self.output_dir = tk.StringVar()
         self.rows_per_file = tk.IntVar(value=1000)
         self.has_header = tk.BooleanVar(value=True)
+        self.google_sheets_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Choose a CSV file to begin.")
 
         pad = {"padx": 10, "pady": 6}
@@ -73,8 +90,30 @@ class CSVSplitterApp:
         frame3 = ttk.Frame(root)
         frame3.pack(fill="x", **pad)
         ttk.Label(frame3, text="Rows per file:", width=12).pack(side="left")
-        ttk.Spinbox(frame3, from_=1, to=1_000_000, textvariable=self.rows_per_file, width=10).pack(side="left", padx=5)
+        self.rows_spinbox = ttk.Spinbox(frame3, from_=1, to=1_000_000, textvariable=self.rows_per_file, width=10)
+        self.rows_spinbox.pack(side="left", padx=5)
         ttk.Checkbutton(frame3, text="File has a header row", variable=self.has_header).pack(side="left", padx=20)
+
+        # Google Sheets auto-split row
+        frame3b = ttk.Frame(root)
+        frame3b.pack(fill="x", **pad)
+        ttk.Checkbutton(
+            frame3b,
+            text="Split for importing into an existing Google Sheet",
+            variable=self.google_sheets_mode,
+            command=self.toggle_google_sheets_mode,
+        ).pack(side="left")
+        ttk.Label(
+            root,
+            text=(
+                "When checked, rows per file is calculated automatically so each part "
+                "stays safely under Google Sheets' 10,000,000-cell limit and its file "
+                "size limit for importing."
+            ),
+            wraplength=480,
+            justify="left",
+            foreground="#555555",
+        ).pack(fill="x", padx=10)
 
         # Split button
         frame4 = ttk.Frame(root)
@@ -104,6 +143,10 @@ class CSVSplitterApp:
         if path:
             self.output_dir.set(path)
 
+    def toggle_google_sheets_mode(self):
+        state = "disabled" if self.google_sheets_mode.get() else "normal"
+        self.rows_spinbox.config(state=state)
+
     def start_split(self):
         in_path = self.input_path.get().strip()
         out_dir = self.output_dir.get().strip()
@@ -124,13 +167,22 @@ class CSVSplitterApp:
         self.status.set("Splitting...")
         self.progress["value"] = 0
 
+        google_sheets_mode = self.google_sheets_mode.get()
+        if google_sheets_mode:
+            try:
+                num_columns = count_csv_columns(in_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not read the CSV file:\n{e}")
+                return
+            rows_per_file = max(1, GOOGLE_SHEETS_SAFE_CELLS // num_columns)
+
         # Run the split on a background thread so the UI doesn't freeze
         thread = threading.Thread(
-            target=self.split_csv, args=(in_path, out_dir, rows_per_file), daemon=True
+            target=self.split_csv, args=(in_path, out_dir, rows_per_file, google_sheets_mode), daemon=True
         )
         thread.start()
 
-    def split_csv(self, in_path, out_dir, rows_per_file):
+    def split_csv(self, in_path, out_dir, rows_per_file, google_sheets_mode=False):
         base_name = os.path.splitext(os.path.basename(in_path))[0]
         try:
             # First pass: count total data rows for the progress bar
@@ -170,7 +222,8 @@ class CSVSplitterApp:
                         pct = min(100, int(processed / total_rows * 100))
                         self.root.after(0, self.update_progress, pct)
 
-                    if row_count >= rows_per_file:
+                    size_limit_hit = google_sheets_mode and out_file.tell() >= GOOGLE_SHEETS_MAX_FILE_BYTES
+                    if row_count >= rows_per_file or size_limit_hit:
                         out_file.close()
                         file_index += 1
                         row_count = 0
@@ -184,23 +237,25 @@ class CSVSplitterApp:
                         os.remove(last_path)
                         file_index -= 1
 
-            self.root.after(0, self.finish, file_index, out_dir, None)
+            self.root.after(0, self.finish, file_index, out_dir, None, rows_per_file if google_sheets_mode else None)
 
         except Exception as e:
-            self.root.after(0, self.finish, 0, out_dir, str(e))
+            self.root.after(0, self.finish, 0, out_dir, str(e), None)
 
     def update_progress(self, pct):
         self.progress["value"] = pct
 
-    def finish(self, file_count, out_dir, error):
+    def finish(self, file_count, out_dir, error, google_sheets_rows):
         self.split_btn.config(state="normal")
         self.progress["value"] = 100 if not error else 0
         if error:
             self.status.set(f"Error: {error}")
             messagebox.showerror("Error", f"Something went wrong:\n{error}")
         else:
-            self.status.set(f"Done! Created {file_count} file(s) in:\n{out_dir}")
-            messagebox.showinfo("Success", f"Created {file_count} file(s) in:\n{out_dir}")
+            extra = f" (~{google_sheets_rows} rows/file, sized for Google Sheets)" if google_sheets_rows else ""
+            message = f"Done! Created {file_count} file(s){extra} in:\n{out_dir}"
+            self.status.set(message)
+            messagebox.showinfo("Success", message)
 
 
 if __name__ == "__main__":

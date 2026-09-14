@@ -32,7 +32,8 @@ No extra libraries are required — the app uses only Python's built-in `tkinter
 2. **Output folder** — pick where the split files should be saved (defaults to the input file's folder).
 3. **Rows per file** — how many data rows each output file should contain.
 4. **File has a header row** — leave checked if row 1 is column names; the header is copied into every output file.
-5. Click **Split CSV**. A progress bar shows status, and a confirmation pops up when done.
+5. **Split for importing into an existing Google Sheet** — check this to have rows per file calculated automatically instead (see below).
+6. Click **Split CSV**. A progress bar shows status, and a confirmation pops up when done.
 
 Output files are named:
 ```
@@ -41,6 +42,22 @@ yourfile_part2.csv
 yourfile_part3.csv
 ...
 ```
+
+## Splitting for Google Sheets
+
+Google Sheets caps every spreadsheet at 10,000,000 cells total (across all
+its sheets) and rejects importing a source file larger than roughly 100MB.
+If you're importing several parts into a sheet that already has data in it,
+manually guessing a safe "rows per file" number is error-prone.
+
+Check **Split for importing into an existing Google Sheet** and the app
+will pick the rows-per-file value for you: it reads the column count from
+the CSV and targets 2,000,000 cells per part (well under the 10,000,000
+limit, leaving headroom for data already in the destination sheet and for
+the other parts you're about to import alongside it). Each part is also
+cut early if it would otherwise exceed ~90MB. The "Rows per file" field is
+disabled while this is checked, since it's computed automatically, and the
+actual value used is shown in the completion message.
 
 ## Building a standalone .exe
 
