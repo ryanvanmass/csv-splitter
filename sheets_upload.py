@@ -139,6 +139,20 @@ def _is_cell_limit_error(exc):
     return "would increase the number of cells" in text or "above the limit of" in text
 
 
+def _sheet_has_data(service, spreadsheet_id, sheet_name):
+    """Cheap check: does this sheet/tab's first row already have anything in it?
+
+    Only reads row 1 (not the whole sheet, which could be huge) — good enough
+    to tell whether a header is already there.
+    """
+    result = _execute_with_retry(
+        lambda: service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1"
+        )
+    )
+    return bool(result.get("values"))
+
+
 def _get_workbook_cell_usage(service, spreadsheet_id):
     """Sum each sheet/tab's allocated grid size (rows x columns) — what
     actually counts against the 10,000,000-cell limit, whether or not those
@@ -242,6 +256,9 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
 
     By default rows are appended after whatever is already in the sheet.
     Pass clear_first=True to wipe the sheet's existing contents first.
+    If has_header is True, the CSV's header row is uploaded when the
+    destination sheet/tab is empty (so it ends up with column headers) and
+    skipped when it already has data (to avoid a duplicate header).
     """
     try:
         from googleapiclient.discovery import build
@@ -255,17 +272,25 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
     num_columns = count_csv_columns(csv_path)
     batch_rows = _batch_size_for_columns(num_columns)
 
-    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
-        total_rows = sum(1 for _ in csv.reader(f))
-    if has_header and total_rows > 0:
-        total_rows -= 1
-    total_rows = max(total_rows, 0)
-
     creds = get_credentials()
     service = build("sheets", "v4", credentials=creds)
 
     if clear_first:
         _clear_sheet(service, spreadsheet_id, sheet_name)
+
+    # Only skip the CSV's header row if the destination already has one —
+    # otherwise the sheet would end up with no column headers at all. A
+    # freshly cleared or brand-new sheet/tab is empty, so its header goes in.
+    try:
+        skip_header = has_header and _sheet_has_data(service, spreadsheet_id, sheet_name)
+    except SheetsUploadError:
+        skip_header = has_header  # preserve old behavior if this check fails
+
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        total_rows = sum(1 for _ in csv.reader(f))
+    if skip_header and total_rows > 0:
+        total_rows -= 1
+    total_rows = max(total_rows, 0)
 
     # Fail fast with a clear, actionable message instead of discovering the
     # workbook is full partway through a long upload.
@@ -291,7 +316,7 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
     uploaded = 0
     with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
-        if has_header:
+        if skip_header:
             next(reader, None)
 
         chunk = []

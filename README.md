@@ -93,6 +93,12 @@ limit to work around — the only constraints left are Google Sheets'
 overall 10,000,000-cell-per-spreadsheet limit and the API's own request
 rate limits (the app already retries automatically on rate-limit errors).
 
+If **File has a header row** is checked, that header is uploaded as the
+sheet's first row when the destination sheet/tab is empty, and skipped
+when it already has data — so a header ends up in the sheet exactly once,
+whether you're starting fresh or appending to something that already has
+one.
+
 **One-time setup**, per Google account:
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and
