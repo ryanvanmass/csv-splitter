@@ -32,14 +32,13 @@ from tkinter import filedialog, messagebox, ttk
 # Google Sheets limits (as of 2026): a spreadsheet maxes out at 10,000,000
 # cells total across all its sheets, and Google's documented per-file import
 # cap is ~100MB. In practice, though, the "Import file" dialog used to add
-# data to an *existing* spreadsheet rejects files well below that figure —
-# users routinely hit "too large to import directly" on plain CSVs under
-# 70MB. These targets are kept far below both the byte and cell ceilings so
-# every part reliably imports, and so several parts can be imported one
-# after another into a sheet that already holds data without approaching
-# the 10,000,000-cell total.
-GOOGLE_SHEETS_SAFE_CELLS = 300_000
-GOOGLE_SHEETS_MAX_FILE_BYTES = 10 * 1024 * 1024
+# data to an *existing* spreadsheet can reject files well below that figure.
+# GOOGLE_SHEETS_SAFE_CELLS is a backstop only, kept comfortably under the
+# 10,000,000-cell total (with headroom for data already in the destination
+# sheet and the other parts being imported alongside it) — it's the target
+# file size, set by the user, that normally decides how each part is cut.
+GOOGLE_SHEETS_SAFE_CELLS = 2_000_000
+GOOGLE_SHEETS_DEFAULT_MB = 25
 
 
 def count_csv_columns(path):
@@ -71,6 +70,7 @@ class CSVSplitterApp:
         self.rows_per_file = tk.IntVar(value=1000)
         self.has_header = tk.BooleanVar(value=True)
         self.google_sheets_mode = tk.BooleanVar(value=False)
+        self.google_sheets_mb = tk.IntVar(value=GOOGLE_SHEETS_DEFAULT_MB)
         self.status = tk.StringVar(value="Choose a CSV file to begin.")
 
         pad = {"padx": 10, "pady": 6}
@@ -106,12 +106,18 @@ class CSVSplitterApp:
             variable=self.google_sheets_mode,
             command=self.toggle_google_sheets_mode,
         ).pack(side="left")
+        ttk.Label(frame3b, text="Target size (MB):").pack(side="left", padx=(20, 5))
+        self.google_sheets_mb_spinbox = ttk.Spinbox(
+            frame3b, from_=1, to=95, textvariable=self.google_sheets_mb, width=6, state="disabled"
+        )
+        self.google_sheets_mb_spinbox.pack(side="left")
         ttk.Label(
             root,
             text=(
                 "When checked, rows per file is calculated automatically so each part "
-                "stays safely under Google Sheets' 10,000,000-cell limit and its file "
-                "size limit for importing."
+                "stays near the target size above. Google's own import dialog can reject "
+                "files well under its documented 100MB limit, so if a part still gets "
+                "rejected, lower this number and split again."
             ),
             wraplength=480,
             justify="left",
@@ -147,8 +153,9 @@ class CSVSplitterApp:
             self.output_dir.set(path)
 
     def toggle_google_sheets_mode(self):
-        state = "disabled" if self.google_sheets_mode.get() else "normal"
-        self.rows_spinbox.config(state=state)
+        enabled = self.google_sheets_mode.get()
+        self.rows_spinbox.config(state="disabled" if enabled else "normal")
+        self.google_sheets_mb_spinbox.config(state="normal" if enabled else "disabled")
 
     def start_split(self):
         in_path = self.input_path.get().strip()
@@ -171,6 +178,7 @@ class CSVSplitterApp:
         self.progress["value"] = 0
 
         google_sheets_mode = self.google_sheets_mode.get()
+        max_file_bytes = 0
         if google_sheets_mode:
             try:
                 num_columns = count_csv_columns(in_path)
@@ -178,14 +186,17 @@ class CSVSplitterApp:
                 messagebox.showerror("Error", f"Could not read the CSV file:\n{e}")
                 return
             rows_per_file = max(1, GOOGLE_SHEETS_SAFE_CELLS // num_columns)
+            max_file_bytes = max(1, self.google_sheets_mb.get()) * 1024 * 1024
 
         # Run the split on a background thread so the UI doesn't freeze
         thread = threading.Thread(
-            target=self.split_csv, args=(in_path, out_dir, rows_per_file, google_sheets_mode), daemon=True
+            target=self.split_csv,
+            args=(in_path, out_dir, rows_per_file, google_sheets_mode, max_file_bytes),
+            daemon=True,
         )
         thread.start()
 
-    def split_csv(self, in_path, out_dir, rows_per_file, google_sheets_mode=False):
+    def split_csv(self, in_path, out_dir, rows_per_file, google_sheets_mode=False, max_file_bytes=0):
         base_name = os.path.splitext(os.path.basename(in_path))[0]
         try:
             # First pass: count total data rows for the progress bar
@@ -225,7 +236,7 @@ class CSVSplitterApp:
                         pct = min(100, int(processed / total_rows * 100))
                         self.root.after(0, self.update_progress, pct)
 
-                    size_limit_hit = google_sheets_mode and out_file.tell() >= GOOGLE_SHEETS_MAX_FILE_BYTES
+                    size_limit_hit = google_sheets_mode and out_file.tell() >= max_file_bytes
                     if row_count >= rows_per_file or size_limit_hit:
                         out_file.close()
                         file_index += 1

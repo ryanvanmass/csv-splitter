@@ -48,21 +48,23 @@ yourfile_part3.csv
 Google Sheets caps every spreadsheet at 10,000,000 cells total (across all
 its sheets). Google's *documented* per-file import limit is around 100MB,
 but in practice the "Import file" dialog used to add data to an existing
-spreadsheet often rejects plain CSVs well below that — with a "This file
-is too large to import directly into Google Sheets" error — sometimes on
-files as small as 70MB. If you're importing several parts into a sheet
-that already has data in it, manually guessing a safe "rows per file"
-number is error-prone.
+spreadsheet can reject plain CSVs well below that — with a "This file is
+too large to import directly into Google Sheets" error — and exactly how
+far below varies. If you're importing several parts into a sheet that
+already has data in it, manually guessing a safe "rows per file" number is
+error-prone.
 
-Check **Split for importing into an existing Google Sheet** and the app
-will pick the rows-per-file value for you: it reads the column count from
-the CSV and targets 300,000 cells per part, and also cuts a part early if
-it would otherwise exceed 10MB. Both targets are kept far below Google's
-real-world failure points, with headroom for data already in the
-destination sheet and the other parts you're about to import alongside it.
-The "Rows per file" field is disabled while this is checked, since it's
-computed automatically, and the actual value used is shown in the
-completion message.
+Check **Split for importing into an existing Google Sheet** and set a
+**Target size (MB)** (25MB by default). The app reads the column count
+from the CSV and calculates rows per file to hit that size, cutting a part
+early if it would otherwise run over. The "Rows per file" field is
+disabled while this is checked, since it's computed automatically, and the
+actual rows/file value used is shown in the completion message.
+
+25MB is a reasonable starting point, but Google's real threshold for this
+dialog isn't published and seems to depend on the file itself — if a part
+still gets rejected, split again with a lower target size; if 25MB parts
+import fine, you can raise it to get fewer, larger files.
 
 ## Building a standalone .exe
 
