@@ -344,8 +344,9 @@ class CSVSplitterApp:
         if clear_first:
             confirmed = messagebox.askyesno(
                 "Clear sheet first?",
-                f'This will permanently erase all existing content in "{sheet_name}" '
-                "before uploading. This cannot be undone. Continue?",
+                f'This will permanently delete all existing rows in "{sheet_name}" '
+                "before uploading — not just their values, but the rows themselves, "
+                "to free up this sheet's cell budget. This cannot be undone. Continue?",
                 icon="warning",
             )
             if not confirmed:

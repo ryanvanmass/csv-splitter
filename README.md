@@ -116,12 +116,29 @@ rate limits (the app already retries automatically on rate-limit errors).
 2. Enter the name of the sheet/tab to upload to (e.g. `Sheet1`) in
    **Sheet/tab name**.
 3. By default, rows are appended after whatever is already in that sheet.
-   Check **Clear existing sheet contents first** to erase everything in
-   that sheet/tab before uploading instead — you'll be asked to confirm,
-   since this can't be undone.
+   Check **Clear existing sheet contents first** to delete that sheet/tab's
+   existing rows before uploading instead — you'll be asked to confirm,
+   since this can't be undone. This actually deletes the rows (not just
+   their values) because Google Sheets counts a sheet's allocated size
+   toward the cell limit below, regardless of whether it holds data —
+   merely clearing values wouldn't free up any room.
 4. Click **Upload to Google Sheet**. The first time, a browser window opens
    asking you to sign in and grant access — after that, a cached token
    (stored in `~/.csv_splitter/token.json`) is reused automatically.
+
+**The 10,000,000-cell limit:** this one is a hard Google Sheets platform
+limit — it applies to the whole spreadsheet (every tab combined) and
+can't be worked around by the API, by splitting files, or by any setting
+in this app. If a spreadsheet doesn't have enough room left, the app now
+checks before starting the upload and tells you exactly how much room is
+left and how many rows will fit, rather than failing partway through.
+Your options at that point: clear the target sheet/tab (see above), trim
+the CSV, or upload the remainder into a separate Google Sheet (each
+spreadsheet gets its own independent 10,000,000-cell budget). If you're
+regularly working with datasets too big for a spreadsheet at all, Google's
+own suggested path is [Connected Sheets](https://support.google.com/docs/answer/9702507),
+which queries BigQuery data from within Sheets instead of loading it all
+into cells.
 
 ## Building a standalone .exe
 
@@ -173,3 +190,4 @@ the target machine.
 | "No Google API credentials found" error | Follow the one-time setup steps above and make sure `client_secret.json` is saved in the exact folder the error message names |
 | Browser sign-in page shows "Google hasn't verified this app" | Expected for a personal OAuth client — click **Advanced → Go to (your app name)** to proceed; this only appears because the app isn't published for public use, which is fine for personal/internal use |
 | Upload fails with a permission or "not found" error | Make sure the Google account you signed in with has edit access to the destination sheet |
+| "This won't fit" / hit the 10,000,000-cell limit | See "The 10,000,000-cell limit" above — clear the sheet/tab, trim the CSV, or use a separate Google Sheet |
