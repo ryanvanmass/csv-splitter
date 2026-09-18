@@ -368,25 +368,37 @@ class CSVSplitterApp:
             self.root.after(0, self.update_progress, pct)
 
         try:
-            uploaded = sheets_upload.upload_csv_to_sheet(
+            destinations = sheets_upload.upload_csv_to_sheet(
                 in_path, sheet_ref, sheet_name, self.has_header.get(),
                 progress_callback=progress_cb, clear_first=clear_first,
             )
-            self.root.after(0, self.finish_upload, uploaded, sheet_name, None)
+            self.root.after(0, self.finish_upload, destinations, None)
         except Exception as e:
-            self.root.after(0, self.finish_upload, 0, sheet_name, str(e))
+            self.root.after(0, self.finish_upload, None, str(e))
 
-    def finish_upload(self, row_count, sheet_name, error):
+    def finish_upload(self, destinations, error):
         self.split_btn.config(state="normal")
         self.upload_btn.config(state="normal")
         self.progress["value"] = 100 if not error else 0
         if error:
             self.status.set(f"Error: {error}")
             messagebox.showerror("Error", f"Something went wrong:\n{error}")
+            return
+
+        total_rows = sum(d["rows"] for d in destinations)
+        if len(destinations) == 1:
+            d = destinations[0]
+            message = f'Done! Uploaded {total_rows:,} row(s) to "{d["title"]}" (tab "{d["sheet_name"]}").'
         else:
-            message = f'Done! Uploaded {row_count} row(s) to "{sheet_name}".'
-            self.status.set(message)
-            messagebox.showinfo("Success", message)
+            lines = [
+                f"Done! Uploaded {total_rows:,} row(s) across {len(destinations)} Google Sheets "
+                "(the destination filled up, so extra sheets were created automatically):"
+            ]
+            for d in destinations:
+                lines.append(f'  • "{d["title"]}" ({d["rows"]:,} rows) — {d["url"]}')
+            message = "\n".join(lines)
+        self.status.set(message)
+        messagebox.showinfo("Success", message)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,13 @@ This sidesteps Google Sheets' file-import size limits entirely: instead of
 writing a CSV and having the browser upload it, rows are pushed straight
 into the sheet through the API, in small batches.
 
+Google Sheets' hard, non-negotiable cap remains, though: a spreadsheet's
+cell count is its allocated grid size (rows x columns, summed across every
+sheet/tab in it, not just cells holding data) and can't exceed 10,000,000.
+No amount of batching works around that once a workbook is full — so when
+it fills up mid-upload, this module creates a new spreadsheet automatically
+and keeps going there instead of failing. See upload_csv_to_sheet.
+
 Requires (not needed for CSV splitting, only for this upload path):
     pip install google-auth google-auth-oauthlib google-api-python-client
 
@@ -36,12 +43,6 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 BATCH_CELLS_TARGET = 500_000
 MIN_BATCH_ROWS = 100
 MAX_BATCH_ROWS = 10_000
-
-# Google Sheets' hard, non-negotiable cap: a spreadsheet's cell count is its
-# allocated grid size (rows x columns, summed across every sheet/tab in it),
-# not just the cells that hold data. This is a real platform ceiling — no
-# amount of batching or splitting works around it once a workbook is full.
-GOOGLE_SHEETS_CELL_LIMIT = 10_000_000
 
 
 class SheetsUploadError(Exception):
@@ -120,6 +121,15 @@ def _batch_size_for_columns(num_columns):
     return max(MIN_BATCH_ROWS, min(MAX_BATCH_ROWS, size))
 
 
+class _CellLimitHit(Exception):
+    """Internal signal: this API call would exceed the 10,000,000-cell limit."""
+
+
+def _is_cell_limit_error(exc):
+    text = str(exc)
+    return "would increase the number of cells" in text or "above the limit of" in text
+
+
 def _execute_with_retry(build_request):
     from googleapiclient.errors import HttpError
 
@@ -127,16 +137,13 @@ def _execute_with_retry(build_request):
         try:
             return build_request().execute()
         except HttpError as e:
+            if _is_cell_limit_error(e):
+                raise _CellLimitHit() from e
             status = getattr(e.resp, "status", None)
             if status in (429, 500, 503) and attempt < 4:
                 time.sleep(2**attempt)
                 continue
             raise SheetsUploadError(f"Google Sheets API error: {e}") from e
-
-
-def _is_cell_limit_error(exc):
-    text = str(exc)
-    return "would increase the number of cells" in text or "above the limit of" in text
 
 
 def _sheet_has_data(service, spreadsheet_id, sheet_name):
@@ -153,20 +160,27 @@ def _sheet_has_data(service, spreadsheet_id, sheet_name):
     return bool(result.get("values"))
 
 
-def _get_workbook_cell_usage(service, spreadsheet_id):
-    """Sum each sheet/tab's allocated grid size (rows x columns) — what
-    actually counts against the 10,000,000-cell limit, whether or not those
-    cells hold data."""
+def _get_spreadsheet_title(service, spreadsheet_id):
     meta = _execute_with_retry(
-        lambda: service.spreadsheets().get(
-            spreadsheetId=spreadsheet_id, fields="sheets.properties.gridProperties"
+        lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="properties.title")
+    )
+    return meta.get("properties", {}).get("title", "Untitled spreadsheet")
+
+
+def _create_continuation_spreadsheet(service, base_title, part_number):
+    """Create a new spreadsheet to hold the overflow once the original is full.
+
+    Creating a spreadsheet is covered by the same "spreadsheets" OAuth scope
+    already used for reading/writing, so this needs no extra permission.
+    """
+    result = _execute_with_retry(
+        lambda: service.spreadsheets().create(
+            body={"properties": {"title": f"{base_title} (continued {part_number})"}},
+            fields="spreadsheetId,spreadsheetUrl,sheets.properties.title",
         )
     )
-    total = 0
-    for sheet in meta.get("sheets", []):
-        grid = sheet.get("properties", {}).get("gridProperties", {})
-        total += grid.get("rowCount", 0) * grid.get("columnCount", 0)
-    return total
+    sheet_title = result["sheets"][0]["properties"]["title"]
+    return result["spreadsheetId"], result["spreadsheetUrl"], sheet_title
 
 
 def _clear_sheet(service, spreadsheet_id, sheet_name):
@@ -233,32 +247,24 @@ def _append_chunk(service, spreadsheet_id, sheet_name, chunk):
     )
 
 
-def _append_chunk_tracked(service, spreadsheet_id, sheet_name, chunk, uploaded_so_far, total_rows):
-    try:
-        _append_chunk(service, spreadsheet_id, sheet_name, chunk)
-    except SheetsUploadError as e:
-        if _is_cell_limit_error(e):
-            raise SheetsUploadError(
-                f"Uploaded {uploaded_so_far:,} of {total_rows:,} row(s) before hitting "
-                f"Google Sheets' {GOOGLE_SHEETS_CELL_LIMIT:,}-cell-per-spreadsheet limit. "
-                "This spreadsheet is full.\n\n"
-                'To upload the rest: check "Clear existing sheet contents first" and '
-                "re-upload (this deletes this sheet/tab's existing rows to reclaim "
-                "space), trim the CSV, or upload the remainder into a separate Google "
-                "Sheet."
-            ) from e
-        raise
-
-
 def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
                          progress_callback=None, clear_first=False):
-    """Stream a CSV's rows into an existing Google Sheet. Returns rows uploaded.
+    """Stream a CSV's rows into an existing Google Sheet via the API.
 
     By default rows are appended after whatever is already in the sheet.
     Pass clear_first=True to wipe the sheet's existing contents first.
-    If has_header is True, the CSV's header row is uploaded when the
-    destination sheet/tab is empty (so it ends up with column headers) and
-    skipped when it already has data (to avoid a duplicate header).
+    If has_header is True, the CSV's header row is uploaded whenever the
+    current destination sheet/tab is empty (so it ends up with column
+    headers) and skipped when it already has data (to avoid a duplicate).
+
+    If the destination spreadsheet fills up — Google Sheets' hard
+    10,000,000-cell-per-spreadsheet limit, which no amount of batching can
+    get around — a new spreadsheet titled "<original title> (continued N)"
+    is created automatically and the rest of the CSV flows into that
+    instead of failing. This can repeat multiple times for very large CSVs.
+
+    Returns a list of dicts, one per spreadsheet actually written to:
+        {"spreadsheet_id", "url", "title", "sheet_name", "rows"}
     """
     try:
         from googleapiclient.discovery import build
@@ -278,60 +284,86 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
     if clear_first:
         _clear_sheet(service, spreadsheet_id, sheet_name)
 
-    # Only skip the CSV's header row if the destination already has one —
-    # otherwise the sheet would end up with no column headers at all. A
-    # freshly cleared or brand-new sheet/tab is empty, so its header goes in.
-    try:
-        skip_header = has_header and _sheet_has_data(service, spreadsheet_id, sheet_name)
-    except SheetsUploadError:
-        skip_header = has_header  # preserve old behavior if this check fails
-
     with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
-        total_rows = sum(1 for _ in csv.reader(f))
-    if skip_header and total_rows > 0:
-        total_rows -= 1
-    total_rows = max(total_rows, 0)
+        raw_rows = sum(1 for _ in csv.reader(f))
+    total_data_rows = max(raw_rows - (1 if has_header else 0), 0)
 
-    # Fail fast with a clear, actionable message instead of discovering the
-    # workbook is full partway through a long upload.
+    base_title = _get_spreadsheet_title(service, spreadsheet_id)
     try:
-        current_cells = _get_workbook_cell_usage(service, spreadsheet_id)
+        original_is_empty = not _sheet_has_data(service, spreadsheet_id, sheet_name)
     except SheetsUploadError:
-        current_cells = None  # don't block the upload if this check itself fails
+        original_is_empty = False  # if unsure, don't risk duplicating an existing header
 
-    if current_cells is not None and total_rows > 0:
-        incoming_cells = total_rows * num_columns
-        remaining = GOOGLE_SHEETS_CELL_LIMIT - current_cells
-        if incoming_cells > remaining:
-            max_rows = max(0, remaining // num_columns)
-            raise SheetsUploadError(
-                f"This won't fit: the spreadsheet already uses {current_cells:,} of "
-                f"{GOOGLE_SHEETS_CELL_LIMIT:,} cells, leaving room for about "
-                f"{max_rows:,} more row(s) here, but this CSV has {total_rows:,}.\n\n"
-                'Options: check "Clear existing sheet contents first" to reclaim this '
-                "sheet/tab's space, trim the CSV, or upload the remainder into a "
-                "separate Google Sheet."
-            )
+    state = {
+        "dest": {
+            "spreadsheet_id": spreadsheet_id,
+            "sheet_name": sheet_name,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+            "title": base_title,
+            "rows": 0,
+            "is_empty": original_is_empty,
+        },
+        "destinations": None,  # set below, same list object as dest's container
+        "uploaded_total": 0,
+        "part_number": 1,
+        "header_row": None,
+    }
+    state["destinations"] = [state["dest"]]
 
-    uploaded = 0
+    def send(chunk):
+        d = state["dest"]
+        rows_to_send = chunk
+        if d["is_empty"] and d["rows"] == 0 and state["header_row"] is not None:
+            rows_to_send = [state["header_row"]] + chunk
+
+        spillovers = 0
+        while True:
+            try:
+                _append_chunk(service, d["spreadsheet_id"], d["sheet_name"], rows_to_send)
+                d["rows"] += len(rows_to_send)
+                state["uploaded_total"] += len(chunk)
+                return
+            except _CellLimitHit:
+                spillovers += 1
+                if spillovers > 3:
+                    raise SheetsUploadError(
+                        f"Even a brand-new, empty Google Sheet can't fit a single batch of "
+                        f"{len(rows_to_send):,} row(s) x {num_columns} column(s) — this CSV "
+                        "has far too many columns for Google Sheets to hold. Try a CSV with "
+                        "fewer columns."
+                    )
+                state["part_number"] += 1
+                new_id, new_url, new_sheet_name = _create_continuation_spreadsheet(
+                    service, base_title, state["part_number"]
+                )
+                d = {
+                    "spreadsheet_id": new_id,
+                    "sheet_name": new_sheet_name,
+                    "url": new_url,
+                    "title": f"{base_title} (continued {state['part_number']})",
+                    "rows": 0,
+                    "is_empty": True,
+                }
+                state["dest"] = d
+                state["destinations"].append(d)
+                rows_to_send = [state["header_row"]] + chunk if state["header_row"] is not None else chunk
+
     with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
-        if skip_header:
-            next(reader, None)
+        if has_header:
+            state["header_row"] = next(reader, None)
 
         chunk = []
         for row in reader:
             chunk.append(row)
             if len(chunk) >= batch_rows:
-                _append_chunk_tracked(service, spreadsheet_id, sheet_name, chunk, uploaded, total_rows)
-                uploaded += len(chunk)
+                send(chunk)
                 if progress_callback:
-                    progress_callback(uploaded, total_rows)
+                    progress_callback(state["uploaded_total"], total_data_rows)
                 chunk = []
         if chunk:
-            _append_chunk_tracked(service, spreadsheet_id, sheet_name, chunk, uploaded, total_rows)
-            uploaded += len(chunk)
+            send(chunk)
             if progress_callback:
-                progress_callback(uploaded, total_rows)
+                progress_callback(state["uploaded_total"], total_data_rows)
 
-    return uploaded
+    return [d for d in state["destinations"] if d["rows"] > 0] or state["destinations"][:1]
