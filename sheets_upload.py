@@ -7,10 +7,12 @@ into the sheet through the API, in small batches.
 
 Google Sheets' hard, non-negotiable cap remains, though: a spreadsheet's
 cell count is its allocated grid size (rows x columns, summed across every
-sheet/tab in it, not just cells holding data) and can't exceed 10,000,000.
-No amount of batching works around that once a workbook is full — so when
-it fills up mid-upload, this module creates a new spreadsheet automatically
-and keeps going there instead of failing. See upload_csv_to_sheet.
+sheet/tab in it, not just cells holding data) and can't exceed 10,000,000
+— tabs within one spreadsheet share that same budget, they don't each get
+their own. So when it fills up mid-upload, this module first adds a new
+tab to the SAME spreadsheet and keeps going there; only once the whole
+file is genuinely full does it create a new spreadsheet instead, which
+does have its own independent budget. See upload_csv_to_sheet.
 
 Requires (not needed for CSV splitting, only for this upload path):
     pip install google-auth google-auth-oauthlib google-api-python-client
@@ -152,6 +154,131 @@ def _execute_with_retry(build_request):
             raise SheetsUploadError(f"Google Sheets API error: {e}") from e
 
 
+def _column_letter(n):
+    """Convert a 1-indexed column number to A1-style letters (1->A, 26->Z, 27->AA)."""
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _find_empty_suffix_boundary(is_empty_from, total):
+    """Find the smallest 0-indexed k such that is_empty_from(k) is True —
+    i.e. everything from position k to the end is verified empty.
+
+    is_empty_from(k) must directly query whether that range holds any data
+    (never assumed/inferred), so the result is safe to act on: no risk of
+    treating a sheet with real, sparse data as trimmable.
+
+    Searches by galloping outward from the end (checking window sizes
+    1, 2, 4, 8, ...) before doing a bounded binary search in between, so
+    a *small* empty suffix — the common case; someone scrolled or pasted
+    a few thousand rows past their real data — costs a handful of cheap
+    probes (an empty API response is cheap regardless of range size),
+    rather than the first few probes of a naive top-down binary search
+    landing in the middle of millions of real data rows and pulling all
+    of it back over the network just to check.
+    """
+    if total <= 0:
+        return 0
+
+    window = 1
+    checked_boundary = total  # is_empty_from(total) is trivially true (empty range)
+    lo = max(0, total - window)
+    while lo > 0 and is_empty_from(lo):
+        checked_boundary = lo
+        window *= 2
+        lo = max(0, total - window)
+
+    if lo == 0:
+        if is_empty_from(0):
+            return 0
+        lo_bound, hi_bound = 0, checked_boundary
+    else:
+        lo_bound, hi_bound = lo, checked_boundary
+
+    while lo_bound < hi_bound:
+        mid = (lo_bound + hi_bound) // 2
+        if is_empty_from(mid):
+            hi_bound = mid
+        else:
+            lo_bound = mid + 1
+    return lo_bound
+
+
+def _trim_empty_space(service, spreadsheet_id):
+    """Shrink every sheet/tab in a spreadsheet down to its actual used
+    range, reclaiming cell budget from trailing empty rows/columns that
+    don't hold any data (a sheet's allocated grid size counts against the
+    10,000,000-cell limit regardless of whether cells are filled — see
+    _clear_sheet). Always keeps at least 1 row and 1 column per sheet.
+
+    Returns True if anything was actually trimmed.
+    """
+    meta = _execute_with_retry(
+        lambda: service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties(sheetId,title,gridProperties)",
+        )
+    )
+
+    requests = []
+    for sheet in meta.get("sheets", []):
+        props = sheet["properties"]
+        sheet_id = props["sheetId"]
+        title = props["title"]
+        grid = props.get("gridProperties", {})
+        row_count = grid.get("rowCount", 0)
+        col_count = grid.get("columnCount", 0)
+
+        def row_is_empty_from(k, title=title, row_count=row_count):
+            if k >= row_count:
+                return True
+            return not bool(_execute_with_retry(
+                lambda: service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id, range=f"{title}!{k + 1}:{row_count}"
+                )
+            ).get("values"))
+
+        def col_is_empty_from(k, title=title, col_count=col_count):
+            if k >= col_count:
+                return True
+            start_letter = _column_letter(k + 1)
+            end_letter = _column_letter(col_count)
+            return not bool(_execute_with_retry(
+                lambda: service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id, range=f"{title}!{start_letter}:{end_letter}"
+                )
+            ).get("values"))
+
+        last_row = max(1, _find_empty_suffix_boundary(row_is_empty_from, row_count))
+        if last_row < row_count:
+            requests.append({
+                "deleteDimension": {
+                    "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": last_row, "endIndex": row_count}
+                }
+            })
+
+        last_col = max(1, _find_empty_suffix_boundary(col_is_empty_from, col_count))
+        if last_col < col_count:
+            requests.append({
+                "deleteDimension": {
+                    "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": last_col, "endIndex": col_count}
+                }
+            })
+
+    if not requests:
+        return False
+
+    _execute_with_retry(
+        lambda: service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id, body={"requests": requests}
+        )
+    )
+    return True
+
+
 def _sheet_has_data(service, spreadsheet_id, sheet_name):
     """Cheap check: does this sheet/tab's first row already have anything in it?
 
@@ -173,15 +300,50 @@ def _get_spreadsheet_title(service, spreadsheet_id):
     return meta.get("properties", {}).get("title", "Untitled spreadsheet")
 
 
-def _create_continuation_spreadsheet(service, base_title, part_number):
-    """Create a new spreadsheet to hold the overflow once the original is full.
+def _add_sheet(service, spreadsheet_id, title, num_columns):
+    """Add a new tab to an existing spreadsheet, sized to just fit the
+    CSV's columns rather than accepting Google's default 1000x26 grid —
+    when a spreadsheet is already tight on its cell budget, a wide default
+    tab can itself burn through most of what little room is left before a
+    single row of real data goes in. Raises _CellLimitHit if that
+    spreadsheet has no room left even for a minimal, empty tab.
+    """
+    result = _execute_with_retry(
+        lambda: service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": title,
+                                "gridProperties": {"rowCount": 1, "columnCount": max(num_columns, 1)},
+                            }
+                        }
+                    }
+                ]
+            },
+            fields="replies.addSheet.properties.title",
+        )
+    )
+    return result["replies"][0]["addSheet"]["properties"]["title"]
+
+
+def _create_continuation_spreadsheet(service, base_title, part_number, sheet_name):
+    """Create a new spreadsheet to hold the overflow once the original
+    spreadsheet is full — tabs within one spreadsheet share its cell
+    budget, so a new tab can't gain more room once the whole file is
+    exhausted; only a separate spreadsheet has its own independent budget.
 
     Creating a spreadsheet is covered by the same "spreadsheets" OAuth scope
     already used for reading/writing, so this needs no extra permission.
     """
     result = _execute_with_retry(
         lambda: service.spreadsheets().create(
-            body={"properties": {"title": f"{base_title} (continued {part_number})"}},
+            body={
+                "properties": {"title": f"{base_title} (continued {part_number})"},
+                "sheets": [{"properties": {"title": sheet_name}}],
+            },
             fields="spreadsheetId,spreadsheetUrl,sheets.properties.title",
         )
     )
@@ -272,12 +434,16 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
 
     If the destination spreadsheet fills up — Google Sheets' hard
     10,000,000-cell-per-spreadsheet limit, which no amount of batching can
-    get around — a new spreadsheet titled "<original title> (continued N)"
-    is created automatically and the rest of the CSV flows into that
-    instead of failing. This can repeat multiple times for very large CSVs.
+    get around — a new tab named "<original tab> (continued N)" is added
+    to the SAME spreadsheet and the rest of the CSV flows into that. Tabs
+    share their spreadsheet's cell budget, though, so once the whole file
+    is genuinely full, a new spreadsheet ("<original title> (continued N)")
+    is created instead, with its own independent budget. This can repeat
+    multiple times for very large CSVs, mixing new tabs and new
+    spreadsheets as needed.
 
-    Returns a list of dicts, one per spreadsheet actually written to:
-        {"spreadsheet_id", "url", "title", "sheet_name", "rows"}
+    Returns a list of dicts, one per (spreadsheet, tab) actually written
+    to: {"spreadsheet_id", "url", "title", "sheet_name", "rows"}
     """
     try:
         from googleapiclient.discovery import build
@@ -296,6 +462,15 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
 
     if clear_first:
         _clear_sheet(service, spreadsheet_id, sheet_name)
+
+    # Reclaim any cell budget tied up in trailing empty rows/columns across
+    # every sheet/tab in the destination — common after a stray scroll or
+    # paste inflates a sheet's grid far past its real data — before
+    # deciding whether the CSV needs to spill into new tabs or sheets.
+    try:
+        _trim_empty_space(service, spreadsheet_id)
+    except SheetsUploadError:
+        pass  # not worth failing the upload over; overflow handling below still works
 
     with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
         raw_rows = sum(1 for _ in csv.reader(f))
@@ -330,6 +505,7 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
             rows_to_send = [state["header_row"]] + chunk
 
         spillovers = 0
+        tried_tab_for = set()  # spreadsheet_ids where a new tab has already been tried and failed
         while True:
             try:
                 _append_chunk(service, d["spreadsheet_id"], d["sheet_name"], rows_to_send)
@@ -338,7 +514,7 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
                 return
             except _CellLimitHit:
                 spillovers += 1
-                if spillovers > 3:
+                if spillovers > 6:
                     raise SheetsUploadError(
                         f"Even a brand-new, empty Google Sheet can't fit a single batch of "
                         f"{len(rows_to_send):,} row(s) x {num_columns} column(s) — this CSV "
@@ -346,17 +522,45 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
                         "fewer columns."
                     )
                 state["part_number"] += 1
-                new_id, new_url, new_sheet_name = _create_continuation_spreadsheet(
-                    service, base_title, state["part_number"]
-                )
-                d = {
-                    "spreadsheet_id": new_id,
-                    "sheet_name": new_sheet_name,
-                    "url": new_url,
-                    "title": f"{base_title} (continued {state['part_number']})",
-                    "rows": 0,
-                    "is_empty": True,
-                }
+                continuation_name = f"{sheet_name} (continued {state['part_number']})"
+
+                # Prefer a new tab in the SAME spreadsheet, so everything
+                # stays in one file as long as that file still has room.
+                # Tabs share their spreadsheet's cell budget, though, so
+                # this can fail the same way the append just did — but only
+                # try it once per spreadsheet: if a fresh tab there *also*
+                # can't take the batch, that file is genuinely exhausted,
+                # and trying yet another tab there would just fail again.
+                new_dest = None
+                if d["spreadsheet_id"] not in tried_tab_for:
+                    tried_tab_for.add(d["spreadsheet_id"])
+                    try:
+                        new_sheet_name = _add_sheet(service, d["spreadsheet_id"], continuation_name, num_columns)
+                        new_dest = {
+                            "spreadsheet_id": d["spreadsheet_id"],
+                            "sheet_name": new_sheet_name,
+                            "url": d["url"],
+                            "title": d["title"],
+                            "rows": 0,
+                            "is_empty": True,
+                        }
+                    except _CellLimitHit:
+                        pass  # fall through to a brand-new spreadsheet below
+
+                if new_dest is None:
+                    new_id, new_url, new_sheet_name = _create_continuation_spreadsheet(
+                        service, base_title, state["part_number"], sheet_name
+                    )
+                    new_dest = {
+                        "spreadsheet_id": new_id,
+                        "sheet_name": new_sheet_name,
+                        "url": new_url,
+                        "title": f"{base_title} (continued {state['part_number']})",
+                        "rows": 0,
+                        "is_empty": True,
+                    }
+
+                d = new_dest
                 state["dest"] = d
                 state["destinations"].append(d)
                 rows_to_send = [state["header_row"]] + chunk if state["header_row"] is not None else chunk

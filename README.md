@@ -136,18 +136,31 @@ one.
 limit — it applies to the whole spreadsheet (every tab combined; cells =
 rows x columns, so a wide CSV hits it with far fewer rows than a narrow
 one) and can't be worked around by the API or by any file-size setting.
-What this app does about it: if the destination spreadsheet fills up
-partway through an upload, it automatically creates a new spreadsheet —
-named "\<original title\> (continued 2)", "(continued 3)", and so on — and
-keeps streaming the rest of the CSV into that instead of failing. This can
-repeat as many times as needed for very large CSVs. Each spreadsheet used
-gets its own copy of the header row (since each one starts out empty), and
-the completion message lists every spreadsheet that ended up with data,
-with a link to each. Checking **Clear existing sheet contents first**
-still helps reduce how many spreadsheets you end up with, since it frees
-up the original one before the CSV's own size is factored in. If you're
-regularly working with datasets too big for even a handful of
-spreadsheets, Google's own suggested path is
+Tabs within one spreadsheet share that spreadsheet's budget — they don't
+each get their own — so a new tab can't help once the whole file is
+genuinely full, only a separate spreadsheet can (each one gets its own
+independent 10,000,000-cell budget).
+
+What this app does about it: before uploading anything, it shrinks every
+sheet/tab in the destination down to its actual used range, reclaiming
+budget tied up in trailing empty rows or columns (very common — a sheet
+keeps whatever size it was ever scrolled or pasted to, even if that space
+was never really used). Then, if the destination still fills up partway
+through the upload, it first adds a new tab to the *same* spreadsheet —
+named "\<original tab\> (continued 2)", "(continued 3)", etc. — sized to
+just fit the CSV's columns so it doesn't waste space of its own. Only once
+that spreadsheet is genuinely exhausted (a fresh tab there couldn't take
+the data either) does it create an entirely new spreadsheet — named
+"\<original title\> (continued N)" — with the rest of the CSV flowing into
+that instead of failing. This can repeat as many times as needed for very
+large CSVs, mixing new tabs and new spreadsheets. Every tab used gets its
+own copy of the header row (since each one starts out empty), and the
+completion message lists every spreadsheet and tab that ended up with
+data, with a link to each. Checking **Clear existing sheet contents
+first** still helps reduce how much of this happens, since it frees up the
+original tab before the CSV's own size is factored in. If you're regularly
+working with datasets too big for even a handful of spreadsheets, Google's
+own suggested path is
 [Connected Sheets](https://support.google.com/docs/answer/9702507), which
 queries BigQuery data from within Sheets instead of loading it all into
 cells.
@@ -202,5 +215,5 @@ the target machine.
 | "No Google API credentials found" error | Follow the one-time setup steps above and make sure `client_secret.json` is saved in the exact folder the error message names |
 | Browser sign-in page shows "Google hasn't verified this app" | Expected for a personal OAuth client — click **Advanced → Go to (your app name)** to proceed; this only appears because the app isn't published for public use, which is fine for personal/internal use |
 | Upload fails with a permission or "not found" error | Make sure the Google account you signed in with has edit access to the destination sheet |
-| Upload finished across multiple Google Sheets | Expected for CSVs too big for one spreadsheet's 10,000,000-cell limit — see "The 10,000,000-cell limit" above; every spreadsheet used is listed with a link in the completion message |
+| Upload finished across multiple tabs/sheets | Expected for CSVs too big for one spreadsheet's 10,000,000-cell limit — see "The 10,000,000-cell limit" above; every spreadsheet and tab used is listed with a link in the completion message |
 | "Even a brand-new, empty Google Sheet can't fit a single batch" error | The CSV has too many columns — a single batch of rows already exceeds 10,000,000 cells on its own. Reduce the number of columns |

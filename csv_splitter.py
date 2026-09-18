@@ -390,12 +390,26 @@ class CSVSplitterApp:
             d = destinations[0]
             message = f'Done! Uploaded {total_rows:,} row(s) to "{d["title"]}" (tab "{d["sheet_name"]}").'
         else:
-            lines = [
-                f"Done! Uploaded {total_rows:,} row(s) across {len(destinations)} Google Sheets "
-                "(the destination filled up, so extra sheets were created automatically):"
-            ]
+            # Group by spreadsheet, since overflow can add new tabs to the
+            # same spreadsheet before ever needing a separate one.
+            by_spreadsheet = {}
+            order = []
             for d in destinations:
-                lines.append(f'  • "{d["title"]}" ({d["rows"]:,} rows) — {d["url"]}')
+                if d["spreadsheet_id"] not in by_spreadsheet:
+                    by_spreadsheet[d["spreadsheet_id"]] = {"title": d["title"], "url": d["url"], "tabs": []}
+                    order.append(d["spreadsheet_id"])
+                by_spreadsheet[d["spreadsheet_id"]]["tabs"].append(d)
+
+            lines = [
+                f"Done! Uploaded {total_rows:,} row(s) across {len(destinations)} sheet/tab(s) "
+                f"in {len(order)} Google Sheet(s) (the destination filled up, so extra "
+                "tabs/sheets were created automatically):"
+            ]
+            for sid in order:
+                info = by_spreadsheet[sid]
+                lines.append(f'  • "{info["title"]}" — {info["url"]}')
+                for d in info["tabs"]:
+                    lines.append(f'      - tab "{d["sheet_name"]}": {d["rows"]:,} rows')
             message = "\n".join(lines)
         self.status.set(message)
         messagebox.showinfo("Success", message)
