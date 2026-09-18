@@ -140,9 +140,15 @@ def _execute_with_retry(build_request):
             if _is_cell_limit_error(e):
                 raise _CellLimitHit() from e
             status = getattr(e.resp, "status", None)
-            if status in (429, 500, 503) and attempt < 4:
-                time.sleep(2**attempt)
-                continue
+            if status in (429, 500, 502, 503, 504):
+                if attempt < 4:
+                    time.sleep(2**attempt)
+                    continue
+                raise SheetsUploadError(
+                    f"Google's servers returned a temporary error (HTTP {status}) and kept "
+                    "failing after several retries. This is usually transient — wait a "
+                    "minute and try the upload again."
+                ) from e
             raise SheetsUploadError(f"Google Sheets API error: {e}") from e
 
 
