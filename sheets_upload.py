@@ -197,6 +197,13 @@ def _clear_sheet(service, spreadsheet_id, sheet_name):
     allocated grid dimensions, not just its filled cells, and clearing
     values leaves those dimensions untouched. Deleting the rows outright is
     the only way to actually shrink the grid.
+
+    Grid-shrinking (deleteDimension, by row index) runs before the values
+    clear, and the clear afterward targets only the single row left behind
+    (an explicit "1:1" range) rather than the whole sheet by name — passing
+    a bare sheet name to values.clear() can make the API mis-derive an
+    invalid range (start row past its own end row) on some sheets and fail
+    with a confusing "exceeds grid limits" error.
     """
     meta = _execute_with_retry(
         lambda: service.spreadsheets().get(
@@ -210,12 +217,6 @@ def _clear_sheet(service, spreadsheet_id, sheet_name):
     )
     if sheet_props is None:
         raise SheetsUploadError(f'Sheet/tab "{sheet_name}" was not found in this spreadsheet.')
-
-    _execute_with_retry(
-        lambda: service.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id, range=sheet_name, body={}
-        )
-    )
 
     row_count = sheet_props.get("gridProperties", {}).get("rowCount", 1)
     if row_count > 1:
@@ -238,6 +239,12 @@ def _clear_sheet(service, spreadsheet_id, sheet_name):
                 },
             )
         )
+
+    _execute_with_retry(
+        lambda: service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1", body={}
+        )
+    )
 
 
 def _append_chunk(service, spreadsheet_id, sheet_name, chunk):
