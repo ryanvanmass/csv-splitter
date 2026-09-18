@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# Google Sheets API credentials/tokens — never commit these
+client_secret.json
+token.json

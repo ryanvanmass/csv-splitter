@@ -1,0 +1,5 @@
+# Only needed for the "Upload to Google Sheet (API)" tab.
+# CSV splitting itself uses only Python's standard library.
+google-auth
+google-auth-oauthlib
+google-api-python-client
