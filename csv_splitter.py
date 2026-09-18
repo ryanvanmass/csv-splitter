@@ -30,13 +30,16 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 # Google Sheets limits (as of 2026): a spreadsheet maxes out at 10,000,000
-# cells total across all its sheets, and importing/uploading a source file
-# larger than ~100MB is rejected outright. GOOGLE_SHEETS_SAFE_CELLS is kept
-# well under the hard cap because the target is an *existing* sheet that
-# likely already holds data, and several part files will be imported into
-# it one after another, each adding to the running total.
-GOOGLE_SHEETS_SAFE_CELLS = 2_000_000
-GOOGLE_SHEETS_MAX_FILE_BYTES = 90 * 1024 * 1024
+# cells total across all its sheets, and Google's documented per-file import
+# cap is ~100MB. In practice, though, the "Import file" dialog used to add
+# data to an *existing* spreadsheet rejects files well below that figure —
+# users routinely hit "too large to import directly" on plain CSVs under
+# 70MB. These targets are kept far below both the byte and cell ceilings so
+# every part reliably imports, and so several parts can be imported one
+# after another into a sheet that already holds data without approaching
+# the 10,000,000-cell total.
+GOOGLE_SHEETS_SAFE_CELLS = 300_000
+GOOGLE_SHEETS_MAX_FILE_BYTES = 10 * 1024 * 1024
 
 
 def count_csv_columns(path):
