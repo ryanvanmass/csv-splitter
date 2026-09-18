@@ -289,8 +289,7 @@ class CSVSplitterApp:
                     processed += 1
 
                     if processed % 500 == 0:
-                        pct = min(100, int(processed / total_rows * 100))
-                        self.root.after(0, self.update_progress, pct)
+                        self.root.after(0, self.update_progress, processed, total_rows, "written")
 
                     size_limit_hit = google_sheets_mode and out_file.tell() >= max_file_bytes
                     if row_count >= rows_per_file or size_limit_hit:
@@ -312,8 +311,10 @@ class CSVSplitterApp:
         except Exception as e:
             self.root.after(0, self.finish, 0, out_dir, str(e), None)
 
-    def update_progress(self, pct):
+    def update_progress(self, current, total, verb="processed"):
+        pct = min(100, int(current / total * 100)) if total else 100
         self.progress["value"] = pct
+        self.status.set(f"{current:,} of {total:,} rows {verb} ({pct}%)")
 
     def finish(self, file_count, out_dir, error, google_sheets_rows):
         self.split_btn.config(state="normal")
@@ -364,8 +365,7 @@ class CSVSplitterApp:
 
     def upload_to_sheet(self, in_path, sheet_ref, sheet_name, clear_first):
         def progress_cb(uploaded, total):
-            pct = min(100, int(uploaded / total * 100)) if total else 100
-            self.root.after(0, self.update_progress, pct)
+            self.root.after(0, self.update_progress, uploaded, total, "uploaded")
 
         try:
             destinations = sheets_upload.upload_csv_to_sheet(
