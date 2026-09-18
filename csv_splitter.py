@@ -75,6 +75,7 @@ class CSVSplitterApp:
         self.google_sheets_mb = tk.IntVar(value=GOOGLE_SHEETS_DEFAULT_MB)
         self.sheet_url = tk.StringVar()
         self.sheet_name = tk.StringVar(value="Sheet1")
+        self.clear_sheet_first = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Choose a CSV file to begin.")
 
         pad = {"padx": 10, "pady": 6}
@@ -156,6 +157,14 @@ class CSVSplitterApp:
         frame_tab_name.pack(fill="x", **pad)
         ttk.Label(frame_tab_name, text="Sheet/tab name:", width=14).pack(side="left")
         ttk.Entry(frame_tab_name, textvariable=self.sheet_name, width=20).pack(side="left", padx=5)
+
+        frame_clear = ttk.Frame(upload_tab)
+        frame_clear.pack(fill="x", **pad)
+        ttk.Checkbutton(
+            frame_clear,
+            text="Clear existing sheet contents first (instead of appending)",
+            variable=self.clear_sheet_first,
+        ).pack(side="left")
 
         ttk.Label(
             upload_tab,
@@ -331,24 +340,36 @@ class CSVSplitterApp:
             messagebox.showerror("Error", "Please enter the destination Google Sheet's URL or ID.")
             return
 
+        clear_first = self.clear_sheet_first.get()
+        if clear_first:
+            confirmed = messagebox.askyesno(
+                "Clear sheet first?",
+                f'This will permanently erase all existing content in "{sheet_name}" '
+                "before uploading. This cannot be undone. Continue?",
+                icon="warning",
+            )
+            if not confirmed:
+                return
+
         self.split_btn.config(state="disabled")
         self.upload_btn.config(state="disabled")
         self.status.set("Uploading to Google Sheet... (a browser window may open for sign-in)")
         self.progress["value"] = 0
 
         thread = threading.Thread(
-            target=self.upload_to_sheet, args=(in_path, sheet_ref, sheet_name), daemon=True
+            target=self.upload_to_sheet, args=(in_path, sheet_ref, sheet_name, clear_first), daemon=True
         )
         thread.start()
 
-    def upload_to_sheet(self, in_path, sheet_ref, sheet_name):
+    def upload_to_sheet(self, in_path, sheet_ref, sheet_name, clear_first):
         def progress_cb(uploaded, total):
             pct = min(100, int(uploaded / total * 100)) if total else 100
             self.root.after(0, self.update_progress, pct)
 
         try:
             uploaded = sheets_upload.upload_csv_to_sheet(
-                in_path, sheet_ref, sheet_name, self.has_header.get(), progress_callback=progress_cb
+                in_path, sheet_ref, sheet_name, self.has_header.get(),
+                progress_callback=progress_cb, clear_first=clear_first,
             )
             self.root.after(0, self.finish_upload, uploaded, sheet_name, None)
         except Exception as e:

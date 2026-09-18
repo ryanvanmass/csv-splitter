@@ -114,20 +114,12 @@ def _batch_size_for_columns(num_columns):
     return max(MIN_BATCH_ROWS, min(MAX_BATCH_ROWS, size))
 
 
-def _append_chunk(service, spreadsheet_id, sheet_name, chunk):
+def _execute_with_retry(build_request):
     from googleapiclient.errors import HttpError
 
-    body = {"values": chunk}
     for attempt in range(5):
         try:
-            service.spreadsheets().values().append(
-                spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!A1",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body=body,
-            ).execute()
-            return
+            return build_request().execute()
         except HttpError as e:
             status = getattr(e.resp, "status", None)
             if status in (429, 500, 503) and attempt < 4:
@@ -136,8 +128,34 @@ def _append_chunk(service, spreadsheet_id, sheet_name, chunk):
             raise SheetsUploadError(f"Google Sheets API error: {e}") from e
 
 
-def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header, progress_callback=None):
-    """Stream a CSV's rows into an existing Google Sheet. Returns rows uploaded."""
+def _clear_sheet(service, spreadsheet_id, sheet_name):
+    _execute_with_retry(
+        lambda: service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=sheet_name, body={}
+        )
+    )
+
+
+def _append_chunk(service, spreadsheet_id, sheet_name, chunk):
+    body = {"values": chunk}
+    _execute_with_retry(
+        lambda: service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        )
+    )
+
+
+def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
+                         progress_callback=None, clear_first=False):
+    """Stream a CSV's rows into an existing Google Sheet. Returns rows uploaded.
+
+    By default rows are appended after whatever is already in the sheet.
+    Pass clear_first=True to wipe the sheet's existing contents first.
+    """
     try:
         from googleapiclient.discovery import build
     except ImportError as e:
@@ -158,6 +176,9 @@ def upload_csv_to_sheet(csv_path, spreadsheet_id_or_url, sheet_name, has_header,
 
     creds = get_credentials()
     service = build("sheets", "v4", credentials=creds)
+
+    if clear_first:
+        _clear_sheet(service, spreadsheet_id, sheet_name)
 
     uploaded = 0
     with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:

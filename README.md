@@ -113,12 +113,15 @@ rate limits (the app already retries automatically on rate-limit errors).
 
 1. Open the Google Sheet you want to add data to, and copy its URL (or
    just the long ID from the URL) into **Sheet URL or ID**.
-2. Enter the name of the sheet/tab to append to (e.g. `Sheet1`) in
+2. Enter the name of the sheet/tab to upload to (e.g. `Sheet1`) in
    **Sheet/tab name**.
-3. Click **Upload to Google Sheet**. The first time, a browser window opens
+3. By default, rows are appended after whatever is already in that sheet.
+   Check **Clear existing sheet contents first** to erase everything in
+   that sheet/tab before uploading instead — you'll be asked to confirm,
+   since this can't be undone.
+4. Click **Upload to Google Sheet**. The first time, a browser window opens
    asking you to sign in and grant access — after that, a cached token
    (stored in `~/.csv_splitter/token.json`) is reused automatically.
-4. Rows are appended after whatever is already in that sheet.
 
 ## Building a standalone .exe
 
